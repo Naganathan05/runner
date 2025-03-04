@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  rabbitmq:
+    image: "rabbitmq:4.0-management"
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: user
+      RABBITMQ_DEFAULT_PASS: password
+
+  minio:
+    image: "minio/minio"
+    container_name: minio
+    environment:
+      MINIO_ACCESS_KEY: minioadmin
+      MINIO_SECRET_KEY: minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+
+  cockroachdb:
+    image: cockroachdb/cockroach:v23.1.11
+    container_name: cockroachdb
+    command: start-single-node --insecure
+    ports:
+      - "26257:26257"
+      - "8081:8080"
+    volumes:
+      - cockroach-data:/cockroach/cockroach-data
+
+# postgresql://root@localhost:26257/defaultdb?sslmode=disable
+
+  # worker:
+  #   build: .
+  #   container_name: worker
+  #   depends_on:
+  #     - rabbitmq
+  #     - minio
+  #     - cockroachdb
+  #   environment:
+  #     RABBITMQ_HOST: rabbitmq
+  #     RABBITMQ_QUEUE: task_queue
+  #     MINIO_URL: minio:9000
+  #     MINIO_ACCESS_KEY: minioadmin
+  #     MINIO_SECRET_KEY: minioadmin
+  #     BUCKET_NAME: code-files
+  #     DB_HOST: cockroachdb
+  #     DB_NAME: mydatabase
+  #     DB_USER: root
+  #     DB_PASSWORD: ""
+
+volumes:
+  minio-data:
+  cockroach-data:

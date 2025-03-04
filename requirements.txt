@@ -1,0 +1,8 @@
+pika
+minio
+psycopg2
+deap
+numpy
+matplotlib
+scoop
+deap
