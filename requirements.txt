@@ -6,3 +6,8 @@ numpy
 matplotlib
 scoop
 deap
+scikit-learn
+pillow
+networkx
+pygraphviz
+pandas
