@@ -156,6 +156,8 @@ def process_message(ch, method, properties, body):
     parent_path = os.path.dirname(abs_local_file)
     # print(f"Running {abs_local_file}")
 
+    runType = "scoop"
+
     try:
         conn = psycopg2.connect(COCKROACHDB_URL)
         cur = conn.cursor()
@@ -165,6 +167,13 @@ def process_message(ch, method, properties, body):
         )
         conn.commit()
         print(f"Run {runId} status updated to 'running'.")
+
+        cur.execute(
+            "SELECT type FROM run WHERE id = %s",
+            (runId,),
+        )
+        runType = cur.fetchone()[0]
+        print(f"Run type: {runType}")
     except psycopg2.Error as e:
         print(f"Error updating run status in CockroachDB: {e}")
     finally:
@@ -182,19 +191,31 @@ def process_message(ch, method, properties, body):
 
         file_parent_dir = os.path.dirname(full_file_path)
 
-        print("Running python -m scoop " + full_file_path)
-
-        # Run the subprocess from the parent directory of the python script.
-        result = subprocess.run(
-            ["python", "-m", "scoop", full_file_path],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            cwd=file_parent_dir,  # Set the current working directory
-        )
-        output, error = result.stdout.strip(), result.stderr.strip()
-        print(f"Output: {output}")
-        print(f"Error: {error}")
+        if (runType == "ml"):
+            print("Running python " + full_file_path)
+            # Run the subprocess from the parent directory of the python script.
+            result = subprocess.run(
+                ["python", full_file_path],
+                capture_output=True,
+                text=True,
+                timeout=150,
+                cwd=file_parent_dir,  # Set the current working directory
+            )
+            output, error = result.stdout.strip(), result.stderr.strip()
+            print(f"Output: {output}")
+            print(f"Error: {error}")
+        else:
+            print("Running python -m scoop " + full_file_path)
+            result = subprocess.run(
+                ["python", "-m", "scoop", full_file_path],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                cwd=file_parent_dir,  # Set the current working directory
+            )
+            output, error = result.stdout.strip(), result.stderr.strip()
+            print(f"Output: {output}")
+            print(f"Error: {error}")
 
         # Upload all .txt, .png, .gif files to MinIO.
         for file in os.listdir(file_parent_dir):
