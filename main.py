@@ -191,7 +191,7 @@ def process_message(ch, method, properties, body):
 
         file_parent_dir = os.path.dirname(full_file_path)
 
-        if (runType == "ml"):
+        if (runType == "ml" or runType == "ea"):
             print("Running python " + full_file_path)
             # Run the subprocess from the parent directory of the python script.
             result = subprocess.run(
