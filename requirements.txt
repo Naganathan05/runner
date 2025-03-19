@@ -11,4 +11,3 @@ pillow
 networkx
 pygraphviz
 pandas
-itertools

@@ -7,20 +7,15 @@ from minio.error import S3Error
 import psycopg2
 
 # Read environment variables
-RABBITMQ_URL = os.getenv(
-    "RABBITMQ_URL", "amqp://guest:guest@localhost:5672/"
-)  # Connection string
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://user:password@localhost:5672/")  # Connection string
+
 QUEUE_NAME = os.getenv("RABBITMQ_QUEUE", "task_queue")
 
 MINIO_URL = os.getenv("MINIO_URL", "localhost:9000")
 MINIO_ACCESS_KEY = os.getenv("MINIO_ACCESS_KEY", "minioadmin")
-MINIO_SECRET_KEY = os.getenv(
-    "MINIO_SECRET_KEY", "minioadmin"
-)
+MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 
-COCKROACHDB_URL = os.getenv(
-    "COCKROACHDB_URL", "postgresql://root@localhost:26257/defaultdb?sslmode=disable"
-)
+COCKROACHDB_URL = os.getenv("COCKROACHDB_URL", "postgresql://root@localhost:26257/defaultdb?sslmode=disable")
 
 
 def parse_json_string(json_string):
@@ -191,6 +186,8 @@ def process_message(ch, method, properties, body):
 
         file_parent_dir = os.path.dirname(full_file_path)
 
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+
         if (runType == "ml"):
             print("Running python " + full_file_path)
             # Run the subprocess from the parent directory of the python script.
@@ -247,7 +244,6 @@ def process_message(ch, method, properties, body):
     except Exception as e:
         print(f"Error running {fileName}: {e}")
 
-    ch.basic_ack(delivery_tag=method.delivery_tag)
 
 
 # Connect to RabbitMQ using the connection string
