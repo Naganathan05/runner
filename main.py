@@ -188,7 +188,7 @@ def process_message(ch, method, properties, body):
 
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
-        if (runType == "ml"):
+        if (runType == "ml" or runType == "ea"):
             print("Running python " + full_file_path)
             # Run the subprocess from the parent directory of the python script.
             result = subprocess.run(
