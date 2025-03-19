@@ -1,6 +1,6 @@
 
 services:
-  auth:
+  runner:
     image: ghcr.io/evolutionary-algorithms-on-click/runner:main
     environment:
       COCKROACHDB_URL : postgresql://root@host.docker.internal:26257/defaultdb?sslmode=disable
