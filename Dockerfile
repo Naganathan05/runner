@@ -2,7 +2,7 @@
 FROM python:3.13
 
 # Set the working directory in the container
-WORKDIR /app
+WORKDIR /runner
 
 # Copy the current directory contents into the container
 COPY . .
