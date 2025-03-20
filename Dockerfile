@@ -13,4 +13,4 @@ RUN apt-get update && apt-get install -y graphviz libgraphviz-dev pkg-config
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 # Run the application
-CMD ["python", "main.py"]
+CMD ["python", "-u", "main.py"]
