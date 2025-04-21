@@ -1,11 +1,15 @@
 
 services:
   runner:
-    image: ghcr.io/evolutionary-algorithms-on-click/runner:main
+    # image: ghcr.io/evolutionary-algorithms-on-click/runner:main
+    build:
+      context: .
+      dockerfile: Dockerfile
     environment:
       COCKROACHDB_URL : postgresql://root@host.docker.internal:26257/defaultdb?sslmode=disable
       MINIO_URL : host.docker.internal:9000
-      MINIO_ACCESS_KEY : <minio-key>
-      MINIO_SECRET_KEY : <minio-pass>
-      RABBITMQ_URL : amqp://<user>:<password>@host.docker.internal:5672/
-      RABBITMQ_QUEUE: <task_queue_name>
+      MINIO_ACCESS_KEY : minioadmin
+      MINIO_SECRET_KEY : minioadmin
+      RABBITMQ_URL : amqp://user:password@host.docker.internal:5672/
+      RABBITMQ_QUEUE: task_queue
+      WEBSOCKET_LOG_URL: ws://host.docker.internal:5002/live
