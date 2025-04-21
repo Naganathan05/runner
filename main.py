@@ -285,12 +285,12 @@ def process_message(ch, method, properties, body):
         # --- Execute Subprocess ---
         command = []
 
-        # if runType == "ea" or runType == "ml":
-        #     command = ["python", local_file_path]
-        # else:
-        #     command = ["python", "-m", "scoop", local_file_path]
+        if runType == "ml":
+            command = ["python", local_file_path]
+        else:
+            command = ["python", "-m", "scoop", local_file_path]
 
-        command = ["python", "-m", "scoop", local_file_path]
+        # command = ["python", "-m", "scoop", local_file_path]
         timeout_sec = 3000  # Set timeout for scoop
 
         print(f"Running command: {' '.join(command)} in {file_parent_dir}")
