@@ -10,7 +10,9 @@ import queue
 import websocket
 import time
 
-# Read environment variables
+# import signal
+
+# Read environment variables.
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://user:password@localhost:5672/")
 QUEUE_NAME = os.getenv("RABBITMQ_QUEUE", "task_queue")
 MINIO_URL = os.getenv("MINIO_URL", "localhost:9000")
@@ -20,6 +22,9 @@ COCKROACHDB_URL = os.getenv(
     "COCKROACHDB_URL", "postgresql://root@localhost:26257/defaultdb?sslmode=disable"
 )
 WEBSOCKET_LOG_URL = os.getenv("WEBSOCKET_LOG_URL", "ws://localhost:5002/live")
+
+# Marker for end of stream
+STREAM_END = object()
 
 
 def parse_json_string(json_string):
@@ -79,16 +84,10 @@ def upload_file(run_id, file_path):
         raise e
 
 
-# --- Helper Functions for Streaming ---
-
-# Sentinel object to signal the end of a stream
-STREAM_END = object()
-
-
 def stream_reader(stream, stream_name, log_queue):
     """Reads lines from a stream and puts them onto the queue."""
     try:
-        # Use iter to read lines efficiently
+        # Use iter to read lines efficiently.
         for line in iter(stream.readline, b""):
             try:
                 decoded_line = line.decode("utf-8").rstrip()
@@ -112,8 +111,11 @@ def stream_reader(stream, stream_name, log_queue):
     except Exception as e:
         print(f"Error in stream reader for {stream_name}: {e}")
     finally:
-        # Signal that this stream is finished
+        # Signal that this stream is finished.
         log_queue.put(STREAM_END)
+        print(f"Stream reader for {stream_name} exiting.")
+
+        # Ensure the stream is closed.
         if stream:
             stream.close()
 
@@ -121,7 +123,7 @@ def stream_reader(stream, stream_name, log_queue):
 def log_sender(ws_url, log_queue):
     """Connects to WebSocket and sends logs from the queue."""
     ws = None
-    active_streams = 2  # Start with 2 (stdout, stderr)
+    active_streams = 2  # (stdout, stderr)
     connection_attempts = 0
     max_attempts = 5
     retry_delay = 2  # seconds
@@ -165,7 +167,7 @@ def log_sender(ws_url, log_queue):
         while active_streams > 0:
             try:
                 # Use timeout to prevent blocking indefinitely if queue becomes empty unexpectedly.
-                log_entry = log_queue.get(timeout=150)
+                log_entry = log_queue.get(timeout=3000)
             except queue.Empty:
                 print("Log queue empty timeout reached. Checking connection/streams.")
                 if ws and not ws.connected:
@@ -191,9 +193,11 @@ def log_sender(ws_url, log_queue):
                     break
                 except Exception as e:
                     print(f"Unexpected error sending log: {e}")
-                    break  # Stop sending on unexpected errors.
+                    # Stop sending on unexpected errors.
+                    break
 
-            log_queue.task_done()  # Mark task as done for queue management.
+            # Mark task as done for queue management.
+            log_queue.task_done()
 
     except Exception as e:
         print(f"Error in log sender loop: {e}")
@@ -230,20 +234,19 @@ def process_message(ch, method, properties, body):
         ch.basic_ack(delivery_tag=method.delivery_tag)
         return
 
-    # --- WebSocket Setup ---
+    # WebSocket Setup.
     ws_thread = None
     log_queue = queue.Queue()
     ws_url_for_run = None
     if WEBSOCKET_LOG_URL:
         ws_url_for_run = f"{WEBSOCKET_LOG_URL.rstrip('/')}/{runId}"
-        # Start the log sender thread
+        # Start the log sender thread.
         ws_thread = threading.Thread(
             target=log_sender, args=(ws_url_for_run, log_queue), daemon=True
         )
         ws_thread.start()
     else:
         print("WEBSOCKET_LOG_URL not set. Skipping live log streaming.")
-    # --- End WebSocket Setup ---
 
     local_file_path = None
     process = None
@@ -252,13 +255,13 @@ def process_message(ch, method, properties, body):
     run_status = "failed"
 
     try:
-        # --- Download ---
+        # Download Code.
         local_file_path = download_file(runId, fileName, extension)
         file_parent_dir = os.path.dirname(local_file_path)
         print(f"Code downloaded to: {local_file_path}")
         print(f"Parent directory: {file_parent_dir}")
 
-        # --- Update Status to Running & Get Type ---
+        # Update Status to 'running' & Get Type.
         runType = "scoop"
         try:
             conn = psycopg2.connect(COCKROACHDB_URL)
@@ -282,7 +285,7 @@ def process_message(ch, method, properties, body):
                 cur.close()
                 conn.close()
 
-        # --- Execute Subprocess ---
+        # Execute code.
         command = []
 
         if runType == "ml":
@@ -296,7 +299,7 @@ def process_message(ch, method, properties, body):
         print(f"Running command: {' '.join(command)} in {file_parent_dir}")
         print(f"Timeout: {timeout_sec} seconds")
 
-        # Acknowledge message BEFORE starting the potentially long subprocess
+        # Acknowledge message BEFORE starting the potentially long subprocess.
         print("Acknowledging RabbitMQ message before starting subprocess.")
         ch.basic_ack(delivery_tag=method.delivery_tag)
 
@@ -307,7 +310,7 @@ def process_message(ch, method, properties, body):
             cwd=file_parent_dir,
         )
 
-        # Start reader threads if WebSocket is enabled
+        # Start reader threads if WebSocket is enabled.
         if ws_thread:
             stdout_thread = threading.Thread(
                 target=stream_reader,
@@ -322,43 +325,53 @@ def process_message(ch, method, properties, body):
             stdout_thread.start()
             stderr_thread.start()
         else:
-            # If not streaming, we might still want to capture output later
-            # Or just let it go if not needed
             pass
 
-        # --- Wait for Process Completion ---
+        # Wait for Process Completion.
         try:
             print(f"Waiting for subprocess (PID: {process.pid}) to complete...")
             return_code = process.wait(timeout=timeout_sec)
             print(f"Subprocess finished with return code: {return_code}")
-            if return_code == 0:
+
+            # Check if any .txt files were created which
+            # tells us that the process completed successfully.
+            # This is a workaround for the fact that we don't
+            # have a reliable way to check the process output with exit code.
+            if return_code == 0 and any(
+                file.endswith(".txt")
+                for file in os.listdir(file_parent_dir)
+                if os.path.isfile(os.path.join(file_parent_dir, file))
+            ):
                 run_status = "completed"
             else:
-                run_status = "failed"  # Mark as failed if non-zero exit code
+                run_status = "failed"
 
         except subprocess.TimeoutExpired:
             print(f"Subprocess timed out after {timeout_sec} seconds. Terminating...")
-            # Send SIGTERM first, then SIGKILL if necessary
-            # Killing the process group might be needed if using setsid/preexec_fn=os.setsid
+            # Send SIGTERM first, then SIGKILL if necessary.
+            # Killing the process group might be needed if using setsid/preexec_fn=os.setsid.
             # os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             process.terminate()
             try:
-                process.wait(timeout=5)  # Wait a bit for termination
+                # Wait a bit for termination.
+                process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 print("Process did not terminate gracefully. Sending SIGKILL...")
                 process.kill()
-                process.wait()  # Wait for kill
+                # Wait for kill.
+                process.wait()
             run_status = "timed_out"
             print("Subprocess terminated due to timeout.")
         except Exception as e:
-            # Catch other potential errors during wait
+            # Catch other potential errors during wait.
             print(f"Error waiting for subprocess: {e}")
             run_status = "failed"
             if process.poll() is None:
                 process.kill()
                 process.wait()
 
-        # --- Wait for Log Streaming to Finish ---
+        # Wait for Log Streaming to Finish.
+
         # Ensure reader threads finish processing any remaining output
         # The readers will put STREAM_END onto the queue when their stream closes
         if stdout_thread:
@@ -366,24 +379,23 @@ def process_message(ch, method, properties, body):
         if stderr_thread:
             stderr_thread.join(timeout=10)
 
-        # Wait for the sender thread to send all queued logs
+        # Wait for the sender thread to send all queued logs.
         if ws_thread:
             print("Waiting for log sender thread to finish...")
-            ws_thread.join(timeout=3000)  # Wait for sender (adjust timeout)
+            ws_thread.join(timeout=3000)
             if ws_thread.is_alive():
                 print("Warning: Log sender thread did not finish in time.")
 
-        # --- Upload Results ---
+        # Upload Results to MinIO.
         print(f"Uploading results from {file_parent_dir} for run {runId}...")
         uploaded_files = []
         if os.path.exists(file_parent_dir):
             for file in os.listdir(file_parent_dir):
-                # Include common output types, maybe configure this list
                 if file.endswith(
                     (".txt", ".png", ".gif", ".log", ".csv", ".json", ".pkl")
                 ):
                     file_to_upload = os.path.join(file_parent_dir, file)
-                    if os.path.isfile(file_to_upload):  # Ensure it's a file
+                    if os.path.isfile(file_to_upload):
                         try:
                             upload_file(runId, file_to_upload)
                             uploaded_files.append(file)
@@ -393,7 +405,7 @@ def process_message(ch, method, properties, body):
         else:
             print(f"Directory {file_parent_dir} does not exist, cannot upload results.")
 
-        # --- Final Status Update ---
+        # Final Status Update.
         try:
             conn = psycopg2.connect(COCKROACHDB_URL)
             cur = conn.cursor()
@@ -402,7 +414,7 @@ def process_message(ch, method, properties, body):
             conn.commit()
         except psycopg2.Error as e:
             print(f"Error updating final run status in CockroachDB: {e}")
-            # Log error, but don't necessarily crash the worker
+            # Log error, but don't necessarily crash the worker.
         finally:
             if conn:
                 cur.close()
@@ -410,13 +422,14 @@ def process_message(ch, method, properties, body):
 
     except Exception as e:
         print(f"!! Critical error processing message for run {runId}: {e}")
-        # Ensure process is killed if it's still running
+        # Ensure process is killed if it's still running.
         if process and process.poll() is None:
             print("Killing subprocess due to critical error.")
             process.kill()
             process.wait()
-        run_status = "failed"  # Ensure status is marked as failed
-        # Update DB status to failed if it wasn't already set
+        run_status = "failed"
+
+        # Update DB status to failed if it wasn't already set.
         try:
             conn = psycopg2.connect(COCKROACHDB_URL)
             cur = conn.cursor()
@@ -431,17 +444,9 @@ def process_message(ch, method, properties, body):
                 cur.close()
                 conn.close()
 
-        # NACK the message if we haven't ACKed it yet.
-        # In this revised code, we ACK *before* the subprocess starts.
-        # If a failure happens *before* the ACK, we might want to NACK.
-        # However, the current logic ACK's early. If the goal is retries
-        # on failure, the ACK point needs reconsideration.
-        # For now, we assume early ACK means "don't retry this message".
-        # ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False) # Example if ACK was later
-
     finally:
-        # --- Cleanup ---
-        # Ensure threads are joined (redundant if already joined, but safe)
+        # Cleanup.
+        # Ensure threads are joined (redundant if already joined, but safe).
         if stdout_thread and stdout_thread.is_alive():
             stdout_thread.join(timeout=1)
         if stderr_thread and stderr_thread.is_alive():
@@ -464,19 +469,17 @@ def process_message(ch, method, properties, body):
         print("-" * 20)  # Separator for logs
 
 
-# --- RabbitMQ Connection and Consumption ---
+# RabbitMQ Connection and Consumption.
 try:
     parameters = pika.URLParameters(RABBITMQ_URL)
     connection = pika.BlockingConnection(parameters)
     channel = connection.channel()
     channel.queue_declare(queue=QUEUE_NAME, durable=True)
-    # Set QoS to prevent a worker from grabbing too many messages it can't handle
+    # Set QoS to prevent a worker from grabbing too many messages it can't handle.
     channel.basic_qos(prefetch_count=1)
 
     print("Waiting for messages...")
-    channel.basic_consume(
-        queue=QUEUE_NAME, on_message_callback=process_message
-    )  # Auto-ack is False by default
+    channel.basic_consume(queue=QUEUE_NAME, on_message_callback=process_message)
 
     channel.start_consuming()
 
