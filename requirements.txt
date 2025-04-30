@@ -11,3 +11,4 @@ pillow
 networkx
 pygraphviz
 pandas
+websocket-client
