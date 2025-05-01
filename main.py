@@ -7,10 +7,8 @@ from minio.error import S3Error
 import psycopg2
 import threading
 import queue
-import websocket
+import redis
 import time
-
-# import signal
 
 # Read environment variables.
 RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://user:password@localhost:5672/")
@@ -21,10 +19,11 @@ MINIO_SECRET_KEY = os.getenv("MINIO_SECRET_KEY", "minioadmin")
 COCKROACHDB_URL = os.getenv(
     "COCKROACHDB_URL", "postgresql://root@localhost:26257/defaultdb?sslmode=disable"
 )
-WEBSOCKET_LOG_URL = os.getenv("WEBSOCKET_LOG_URL", "ws://localhost:5002/live")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
 
-# Marker for end of stream
+
 STREAM_END = object()
+LOG_DATA_FIELD = b"log_data"
 
 
 def parse_json_string(json_string):
@@ -87,69 +86,57 @@ def upload_file(run_id, file_path):
 def stream_reader(stream, stream_name, log_queue):
     """Reads lines from a stream and puts them onto the queue."""
     try:
-        # Use iter to read lines efficiently.
         for line in iter(stream.readline, b""):
             try:
                 decoded_line = line.decode("utf-8").rstrip()
                 log_entry = json.dumps({"stream": stream_name, "line": decoded_line})
+                # print(f"Read log: {log_entry}")
                 log_queue.put(log_entry)
             except UnicodeDecodeError:
-                # Handle cases where output might not be valid UTF-8
                 log_entry = json.dumps(
                     {"stream": stream_name, "line": repr(line)[2:-1]}
-                )  # Use repr for safety
+                )
                 log_queue.put(log_entry)
             except Exception as e:
                 print(f"Error processing log line from {stream_name}: {e}")
         print(f"Stream reader for {stream_name} finished.")
-        final_status_message = "__END__"
-        try:
-            log_queue.put(final_status_message)
-            print(f"Final status sent to WebSocket: {final_status_message}")
-        except Exception as e:
-            print(f"Error sending final status to WebSocket: {e}")
     except Exception as e:
         print(f"Error in stream reader for {stream_name}: {e}")
     finally:
-        # Signal that this stream is finished.
         log_queue.put(STREAM_END)
-        print(f"Stream reader for {stream_name} exiting.")
-
-        # Ensure the stream is closed.
+        print(f"Stream reader for {stream_name} exiting (sent STREAM_END).")
         if stream:
             stream.close()
 
 
-def log_sender(ws_url, log_queue):
-    """Connects to WebSocket and sends logs from the queue."""
-    ws = None
+def redis_stream_adder(redis_url, log_queue, run_id):
+    """Connects to Redis and adds logs from the queue to a run-specific Redis Stream."""
+    r = None
     active_streams = 2  # (stdout, stderr)
     connection_attempts = 0
     max_attempts = 5
-    retry_delay = 2  # seconds
+    retry_delay = 2
+    stream_name = run_id  # Use run_id as the stream name
+    srream_ttl_seconds = 120
 
+    # Redis Connection Loop.
     while connection_attempts < max_attempts:
         try:
-            print(f"Attempting to connect to WebSocket: {ws_url}")
-            ws = websocket.create_connection(ws_url, timeout=10)
-            print(f"WebSocket connection established to {ws_url}")
+            print(f"Attempting to connect to Redis for Stream: {redis_url}")
+            r = redis.from_url(redis_url, decode_responses=False)
+            r.ping()
+            print(f"Redis Stream connection established to {redis_url}")
             break
-        except (
-            websocket.WebSocketException,
-            ConnectionRefusedError,
-            TimeoutError,
-            OSError,
-        ) as e:
+        except redis.exceptions.ConnectionError as e:
             connection_attempts += 1
             print(
-                f"WebSocket connection failed (Attempt {connection_attempts}/{max_attempts}): {e}"
+                f"Redis Stream connection failed (Attempt {connection_attempts}/{max_attempts}): {e}"
             )
             if connection_attempts >= max_attempts:
                 print(
-                    "Max connection attempts reached. Cannot send logs via WebSocket."
+                    "Max connection attempts reached. Cannot add logs to Redis Stream."
                 )
-                # Drain the queue to prevent blocking reader threads indefinitely
-                # if they are still producing output (though they should stop soon)
+                # Drain queue.
                 while active_streams > 0:
                     item = log_queue.get()
                     if item is STREAM_END:
@@ -158,101 +145,127 @@ def log_sender(ws_url, log_queue):
                 return
             print(f"Retrying in {retry_delay} seconds...")
             time.sleep(retry_delay)
-            retry_delay *= 2  # Exponential backoff
+            retry_delay *= 2
         except Exception as e:
-            print(f"Unexpected error during WebSocket connection: {e}")
+            print(f"Unexpected error during Redis Stream connection: {e}")
+            # Drain queue.
+            while active_streams > 0:
+                item = log_queue.get()
+                if item is STREAM_END:
+                    active_streams -= 1
+                log_queue.task_done()
             return
 
+    # Log Adding Loop.
+    entries_added = 0
     try:
         while active_streams > 0:
             try:
-                # Use timeout to prevent blocking indefinitely if queue becomes empty unexpectedly.
-                log_entry = log_queue.get(timeout=3000)
+                log_entry = log_queue.get(timeout=300)
             except queue.Empty:
-                print("Log queue empty timeout reached. Checking connection/streams.")
-                if ws and not ws.connected:
-                    print("WebSocket disconnected unexpectedly.")
+                print(
+                    "Log queue empty timeout reached. Checking Redis stream connection."
+                )
+                try:
+                    if r:
+                        r.ping()
+                    else:
+                        break
+                except redis.exceptions.ConnectionError:
+                    print("Redis stream connection lost unexpectedly.")
                     break
                 continue
 
             if log_entry is STREAM_END:
                 active_streams -= 1
                 print(
-                    f"Received end signal. Active streams remaining: {active_streams}"
+                    f"Received stream end signal. Active streams remaining: {active_streams}"
                 )
-            else:
+            elif isinstance(log_entry, str):
                 try:
-                    if ws and ws.connected:
-                        # print(f"Sending log: {log_entry}") # Uncomment for debug
-                        ws.send(log_entry)
+                    if r:
+                        payload = {LOG_DATA_FIELD: log_entry}
+                        # print(f"DEBUG: XADD to stream='{stream_name}' payload='{payload}'") # Debug.
+                        entry_id = r.xadd(stream_name, payload)
+                        r.expire(stream_name, srream_ttl_seconds)
+                        entries_added += 1
+                        # print(f"Added to Redis Stream '{stream_name}', ID: {entry_id.decode()}") # Debug.
                     else:
-                        print("Cannot send log, WebSocket is not connected.")
-                except websocket.WebSocketException as e:
-                    print(f"Error sending log via WebSocket: {e}")
-                    # Handle disconnection or other send errors.
-                    break
+                        print("Cannot add log to stream, Redis is not connected.")
+                except redis.exceptions.RedisError as e:
+                    print(f"Error using XADD for Redis Stream '{stream_name}': {e}")
                 except Exception as e:
-                    print(f"Unexpected error sending log: {e}")
-                    # Stop sending on unexpected errors.
+                    print(f"Unexpected error during XADD: {e}")
                     break
 
-            # Mark task as done for queue management.
             log_queue.task_done()
 
-    except Exception as e:
-        print(f"Error in log sender loop: {e}")
-    finally:
-        print("Log sender thread finishing.")
-        if ws and ws.connected:
+        # After both streams end
+        if r:
+            # Add an End-Of-File marker message to the stream.
+            eof_message = json.dumps({"status": "EOF", "runId": run_id})
+            eof_payload = {LOG_DATA_FIELD: eof_message}
             try:
-                ws.close()
-                print("WebSocket connection closed.")
+                entry_id = r.xadd(stream_name, eof_payload)
+                r.expire(stream_name, srream_ttl_seconds)
+                print(
+                    f"Added EOF marker to Redis Stream '{stream_name}', ID: {entry_id.decode()}"
+                )
+                entries_added += 1
+            except redis.exceptions.RedisError as e:
+                print(f"Error adding EOF marker to Redis Stream: {e}")
+
+    except Exception as e:
+        print(f"Error in Redis stream adder loop: {e}")
+    finally:
+        print(
+            f"Redis stream adder thread finishing. Total entries added: {entries_added}"
+        )
+        if r:
+            try:
+                r.close()
+                print("Redis stream connection closed.")
             except Exception as e:
-                print(f"Error closing WebSocket: {e}")
+                print(f"Error closing Redis stream connection: {e}")
 
 
 # Callback function that is called when a message is received.
 def process_message(ch, method, properties, body):
     """Callback function when a message is received from RabbitMQ"""
-
     msg = body.decode()
     print(f"Received Message: {msg}")
-
     data = parse_json_string(msg)
-
     if data is None:
-        print("Invalid JSON. Ignoring message.")
         ch.basic_ack(delivery_tag=method.delivery_tag)
         return
 
     runId = data.get("runId")
     fileName = data.get("fileName")
     extension = data.get("extension")
-
     if not all([runId, fileName, extension]):
-        print("Missing runId, fileName, or extension in message. Ignoring.")
         ch.basic_ack(delivery_tag=method.delivery_tag)
         return
 
-    # WebSocket Setup.
-    ws_thread = None
+    redis_adder_thread = None
     log_queue = queue.Queue()
-    ws_url_for_run = None
-    if WEBSOCKET_LOG_URL:
-        ws_url_for_run = f"{WEBSOCKET_LOG_URL.rstrip('/')}/{runId}"
-        # Start the log sender thread.
-        ws_thread = threading.Thread(
-            target=log_sender, args=(ws_url_for_run, log_queue), daemon=True
+    if REDIS_URL:
+        # Start the Redis stream adder thread.
+        redis_adder_thread = threading.Thread(
+            target=redis_stream_adder,
+            args=(REDIS_URL, log_queue, runId),
+            daemon=True,
         )
-        ws_thread.start()
+        redis_adder_thread.start()
+        print(f"Redis stream adder thread started for run {runId}, stream: {runId}")
     else:
-        print("WEBSOCKET_LOG_URL not set. Skipping live log streaming.")
+        print("REDIS_URL not set. Skipping log streaming via Redis Streams.")
 
     local_file_path = None
     process = None
     stdout_thread = None
     stderr_thread = None
     run_status = "failed"
+    conn = None
 
     try:
         # Download Code.
@@ -279,23 +292,21 @@ def process_message(ch, method, properties, body):
             run_status = "running"
         except psycopg2.Error as e:
             print(f"Error updating run status/fetching type in CockroachDB: {e}")
+            run_status = "failed"
             raise
         finally:
             if conn:
-                cur.close()
+                if "cur" in locals() and cur:
+                    cur.close()
                 conn.close()
 
         # Execute code.
         command = []
-
         if runType == "ml":
             command = ["python", local_file_path]
         else:
             command = ["python", "-m", "scoop", local_file_path]
-
-        # command = ["python", "-m", "scoop", local_file_path]
-        timeout_sec = 3000  # Set timeout for scoop
-
+        timeout_sec = 3600
         print(f"Running command: {' '.join(command)} in {file_parent_dir}")
         print(f"Timeout: {timeout_sec} seconds")
 
@@ -310,8 +321,8 @@ def process_message(ch, method, properties, body):
             cwd=file_parent_dir,
         )
 
-        # Start reader threads if WebSocket is enabled.
-        if ws_thread:
+        # Start reader threads if Redis is enabled.
+        if redis_adder_thread:
             stdout_thread = threading.Thread(
                 target=stream_reader,
                 args=(process.stdout, "stdout", log_queue),
@@ -325,45 +336,40 @@ def process_message(ch, method, properties, body):
             stdout_thread.start()
             stderr_thread.start()
         else:
-            pass
+            process.stdout.read()
+            process.stderr.read()
+            print("Redis not configured. Subprocess output will not be streamed.")
 
         # Wait for Process Completion.
         try:
             print(f"Waiting for subprocess (PID: {process.pid}) to complete...")
             return_code = process.wait(timeout=timeout_sec)
             print(f"Subprocess finished with return code: {return_code}")
-
-            # Check if any .txt files were created which
-            # tells us that the process completed successfully.
-            # This is a workaround for the fact that we don't
-            # have a reliable way to check the process output with exit code.
-            if return_code == 0 and any(
-                file.endswith(".txt")
-                for file in os.listdir(file_parent_dir)
-                if os.path.isfile(os.path.join(file_parent_dir, file))
-            ):
-                run_status = "completed"
+            if return_code == 0:
+                if any(
+                    file.endswith(".txt")
+                    for file in os.listdir(file_parent_dir)
+                    if os.path.isfile(os.path.join(file_parent_dir, file))
+                ):
+                    run_status = "completed"
+                else:
+                    print(
+                        "Warning: Process exited with code 0 but expected output files not found."
+                    )
+                    run_status = "completed"
             else:
                 run_status = "failed"
-
         except subprocess.TimeoutExpired:
             print(f"Subprocess timed out after {timeout_sec} seconds. Terminating...")
-            # Send SIGTERM first, then SIGKILL if necessary.
-            # Killing the process group might be needed if using setsid/preexec_fn=os.setsid.
-            # os.killpg(os.getpgid(process.pid), signal.SIGTERM)
             process.terminate()
             try:
-                # Wait a bit for termination.
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
-                print("Process did not terminate gracefully. Sending SIGKILL...")
                 process.kill()
-                # Wait for kill.
                 process.wait()
             run_status = "timed_out"
             print("Subprocess terminated due to timeout.")
         except Exception as e:
-            # Catch other potential errors during wait.
             print(f"Error waiting for subprocess: {e}")
             run_status = "failed"
             if process.poll() is None:
@@ -371,29 +377,37 @@ def process_message(ch, method, properties, body):
                 process.wait()
 
         # Wait for Log Streaming to Finish.
-
-        # Ensure reader threads finish processing any remaining output
-        # The readers will put STREAM_END onto the queue when their stream closes
         if stdout_thread:
             stdout_thread.join(timeout=10)
+            if stdout_thread.is_alive():
+                print("Warning: stdout reader thread did not finish.")
         if stderr_thread:
             stderr_thread.join(timeout=10)
+            if stderr_thread.is_alive():
+                print("Warning: stderr reader thread did not finish.")
 
-        # Wait for the sender thread to send all queued logs.
-        if ws_thread:
-            print("Waiting for log sender thread to finish...")
-            ws_thread.join(timeout=3000)
-            if ws_thread.is_alive():
-                print("Warning: Log sender thread did not finish in time.")
+        # Wait for the adder thread to process all queued logs + EOF marker.
+        if redis_adder_thread:
+            print("Waiting for Redis stream adder thread to finish...")
+            redis_adder_thread.join(timeout=20)
+            if redis_adder_thread.is_alive():
+                print("Warning: Redis stream adder thread did not finish in time.")
 
         # Upload Results to MinIO.
         print(f"Uploading results from {file_parent_dir} for run {runId}...")
         uploaded_files = []
         if os.path.exists(file_parent_dir):
+            allowed_extensions = (
+                ".txt",
+                ".png",
+                ".gif",
+                ".log",
+                ".csv",
+                ".json",
+                ".pkl",
+            )
             for file in os.listdir(file_parent_dir):
-                if file.endswith(
-                    (".txt", ".png", ".gif", ".log", ".csv", ".json", ".pkl")
-                ):
+                if file.endswith(allowed_extensions):
                     file_to_upload = os.path.join(file_parent_dir, file)
                     if os.path.isfile(file_to_upload):
                         try:
@@ -403,7 +417,7 @@ def process_message(ch, method, properties, body):
                             print(f"Individual file upload failed for {file}: {e}")
             print(f"Uploaded files: {uploaded_files if uploaded_files else 'None'}")
         else:
-            print(f"Directory {file_parent_dir} does not exist, cannot upload results.")
+            print(f"Directory {file_parent_dir} does not exist.")
 
         # Final Status Update.
         try:
@@ -414,26 +428,25 @@ def process_message(ch, method, properties, body):
             conn.commit()
         except psycopg2.Error as e:
             print(f"Error updating final run status in CockroachDB: {e}")
-            # Log error, but don't necessarily crash the worker.
         finally:
             if conn:
-                cur.close()
+                if "cur" in locals() and cur:
+                    cur.close()
                 conn.close()
 
     except Exception as e:
         print(f"!! Critical error processing message for run {runId}: {e}")
-        # Ensure process is killed if it's still running.
         if process and process.poll() is None:
             print("Killing subprocess due to critical error.")
             process.kill()
-            process.wait()
+            try:
+                process.wait(timeout=5)
+            except:
+                pass
         run_status = "failed"
-
-        # Update DB status to failed if it wasn't already set.
         try:
             conn = psycopg2.connect(COCKROACHDB_URL)
             cur = conn.cursor()
-            # Check current status before overriding? Maybe not, failure overrides.
             print(f"Updating run {runId} status to 'failed' due to critical error.")
             cur.execute("UPDATE run SET status = 'failed' WHERE id = %s", (runId,))
             conn.commit()
@@ -441,58 +454,47 @@ def process_message(ch, method, properties, body):
             print(f"Error updating run status to failed in CockroachDB: {db_e}")
         finally:
             if conn:
-                cur.close()
+                if "cur" in locals() and cur:
+                    cur.close()
                 conn.close()
 
     finally:
-        # Cleanup.
-        # Ensure threads are joined (redundant if already joined, but safe).
+        # Final Cleanup.
         if stdout_thread and stdout_thread.is_alive():
             stdout_thread.join(timeout=1)
         if stderr_thread and stderr_thread.is_alive():
             stderr_thread.join(timeout=1)
-        if ws_thread and ws_thread.is_alive():
-            ws_thread.join(timeout=1)
-
-        # TODO: Add logic to delete the local run directory if desired
-        # Be cautious if multiple workers might access shared directories
-        # if local_file_path:
-        #     run_dir_to_delete = os.path.dirname(local_file_path)
-        #     try:
-        #         print(f"Attempting to remove directory: {run_dir_to_delete}")
-        #         # shutil.rmtree(run_dir_to_delete)
-        #         print(f"Directory {run_dir_to_delete} removed.")
-        #     except Exception as clean_e:
-        #         print(f"Error removing directory {run_dir_to_delete}: {clean_e}")
+        if redis_adder_thread and redis_adder_thread.is_alive():
+            redis_adder_thread.join(timeout=1)
 
         print(f"Finished processing run {runId}. Final status: {run_status}")
-        print("-" * 20)  # Separator for logs
+        print("-" * 20)
+        # TODO: Clean up local files.
 
 
-# RabbitMQ Connection and Consumption.
+# Main RabbitMQ Connection and Consumption
+connection = None
 try:
     parameters = pika.URLParameters(RABBITMQ_URL)
     connection = pika.BlockingConnection(parameters)
     channel = connection.channel()
     channel.queue_declare(queue=QUEUE_NAME, durable=True)
-    # Set QoS to prevent a worker from grabbing too many messages it can't handle.
     channel.basic_qos(prefetch_count=1)
-
     print("Waiting for messages...")
     channel.basic_consume(queue=QUEUE_NAME, on_message_callback=process_message)
-
     channel.start_consuming()
-
 except pika.exceptions.AMQPConnectionError as conn_err:
     print(f"Failed to connect to RabbitMQ: {conn_err}")
     exit(1)
 except KeyboardInterrupt:
-    print("Stopping worker...")
-    if "connection" in locals() and connection.is_open:
+    print("\nStopping worker...")
+    if "channel" in locals() and channel.is_open:
+        channel.stop_consuming()
+    if connection and connection.is_open:
         connection.close()
     print("Worker stopped.")
 except Exception as e:
     print(f"An unexpected error occurred in the main loop: {e}")
-    if "connection" in locals() and connection.is_open:
+    if connection and connection.is_open:
         connection.close()
     exit(1)
